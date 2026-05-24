@@ -19,9 +19,10 @@ Run:
 import asyncio
 import json
 import os
+import re
 import time
 import uuid
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator, Optional, Tuple, Union
 
 import httpx
 from fastapi import FastAPI
@@ -34,13 +35,19 @@ OPENCODE_PASS = os.environ.get("OPENCODE_SERVER_PASSWORD")
 AUTH = (OPENCODE_USER, OPENCODE_PASS) if OPENCODE_PASS else None
 
 # PROXY_AGENT_MODE controls whether opencode's agent loop is engaged.
-#   "off" (default) — disable all tools so opencode acts as a pure model gateway
-#   "on"            — let opencode run its full agent and stream tool calls inline
-AGENT_MODE = os.environ.get("PROXY_AGENT_MODE", "on").lower()
+#   "off" (default) — disable all tools so opencode acts as a pure model gateway.
+#                     Use this when the host (claude code / hermes / Kiro) already
+#                     has its own tool ecosystem and just wants opencode as the LLM.
+#   "on"            — let opencode run its full agent and stream tool calls inline.
+#                     Use this only when you want opencode's built-in tools
+#                     (websearch / bash / read / ...) instead of the host's.
+AGENT_MODE = os.environ.get("PROXY_AGENT_MODE", "off").lower()
 
 # Inline rendering of agent events as content text. Only relevant when AGENT_MODE=on.
-SHOW_TOOLS = os.environ.get("PROXY_SHOW_TOOLS", "1") not in ("0", "false", "False")
-SHOW_REASONING = os.environ.get("PROXY_SHOW_REASONING", "1") not in ("0", "false", "False")
+# Defaults are off so that even if someone flips AGENT_MODE=on, opencode's
+# internal reasoning / tool noise doesn't leak into the host's response stream.
+SHOW_TOOLS = os.environ.get("PROXY_SHOW_TOOLS", "0") not in ("0", "false", "False")
+SHOW_REASONING = os.environ.get("PROXY_SHOW_REASONING", "0") not in ("0", "false", "False")
 TOOL_RESULT_MAX = int(os.environ.get("PROXY_TOOL_RESULT_MAX", "400"))
 
 # Cached list of opencode tool IDs — used to build the all-false map in AGENT_MODE=off.
@@ -57,7 +64,7 @@ class UpstreamError(Exception):
         self.body = body
 
 # ---- Provider config cache (from OpenCode /config/providers) ----
-_provider_cache: dict | None = None
+_provider_cache: Optional[dict] = None
 _provider_cache_ts: float = 0
 
 
@@ -94,7 +101,7 @@ async def _refresh_providers():
         pass
 
 
-def _model_api_info(provider: str, model: str) -> tuple[str, str] | None:
+def _model_api_info(provider: str, model: str) -> Optional[Tuple[str, str]]:
     """Return (api_base_url, api_key) for direct API calling, or None."""
     cfg = _provider_cache
     if not cfg or provider not in cfg:
@@ -123,6 +130,8 @@ class ChatReq(BaseModel):
     stream: bool = False
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
+    tools: Optional[list[dict]] = None
+    tool_choice: Optional[Union[str, dict]] = None
 
     class Config:
         extra = "allow"
@@ -132,7 +141,7 @@ class AnthropicMsg(BaseModel):
     role: str
     # Anthropic allows either a plain string OR a list of content blocks.
     # Block shapes: text / image / document / tool_use / tool_result.
-    content: str | list[dict]
+    content: Union[str, list]
 
 
 class AnthropicReq(BaseModel):
@@ -142,7 +151,7 @@ class AnthropicReq(BaseModel):
     # malformed clients still get a useful error from downstream rather than
     # a Pydantic 422 — we default it when forwarding.
     max_tokens: Optional[int] = None
-    system: Optional[str | list[dict]] = None
+    system: Optional[Union[str, list]] = None
     stream: bool = False
     temperature: Optional[float] = None
     top_p: Optional[float] = None
@@ -185,6 +194,156 @@ def render_prompt(messages: list[Msg]) -> tuple[Optional[str], str]:
             convo_parts.append(f"[{m.role.upper()}]\n{m.content}")
     system = "\n\n".join(system_parts) if system_parts else None
     return system, "\n\n".join(convo_parts)
+
+
+# ---- Tool-calling injection for session path ----
+# When the host (Hermes) passes tools but we can only route through OpenCode's
+# session API (no direct API key), we inject tool definitions into the system
+# prompt and instruct the model to emit tool calls in a parseable XML format.
+# We then parse the model's text output and convert matching XML into OpenAI
+# format tool_calls chunks.
+
+_TOOL_SYSTEM_SUFFIX = """
+
+## Available Tools
+
+You have access to the following tools. When you want to call a tool, you MUST output the tool call blocks in the following XML format:
+
+<tool_call>
+{"name": "tool_name", "arguments": {"arg1": "value1", "arg2": "value2"}}
+</tool_call>
+
+CRITICAL RULES:
+1. Each <tool_call> block must contain exactly ONE JSON object.
+2. If you need to call multiple tools, use multiple separate <tool_call> blocks.
+3. After outputting tool call blocks, STOP IMMEDIATELY. Do NOT output any other text after the </tool_call> tags.
+4. Do NOT predict or fabricate tool results. Wait for the actual results to be provided.
+5. If you want to include a brief explanation before calling tools, put it BEFORE the <tool_call> blocks.
+
+Here are the available tools:
+
+"""
+
+
+def _render_tools_for_prompt(tools: list[dict]) -> str:
+    """Render OpenAI-format tool definitions into a text block for the system prompt."""
+    parts: list[str] = []
+    for tool in tools:
+        if tool.get("type") == "function":
+            fn = tool.get("function", {})
+        else:
+            # Some clients pass tools without the wrapper
+            fn = tool
+        name = fn.get("name", "unknown")
+        desc = fn.get("description", "")
+        params = fn.get("parameters", {})
+        parts.append(f"### {name}")
+        if desc:
+            parts.append(f"Description: {desc}")
+        if params:
+            # Show a compact JSON schema
+            props = params.get("properties", {})
+            required = params.get("required", [])
+            if props:
+                parts.append("Parameters:")
+                for pname, pdef in props.items():
+                    ptype = pdef.get("type", "any")
+                    pdesc = pdef.get("description", "")
+                    req_mark = " (required)" if pname in required else ""
+                    parts.append(f"  - {pname}: {ptype}{req_mark} — {pdesc}")
+        parts.append("")
+    return "\n".join(parts)
+
+
+def _inject_tools_into_system(system: Optional[str], tools: list[dict]) -> str:
+    """Append tool definitions to the system prompt."""
+    tool_text = _TOOL_SYSTEM_SUFFIX + _render_tools_for_prompt(tools)
+    if system:
+        return system + tool_text
+    return tool_text.strip()
+
+
+# Regex to find <tool_call>...</tool_call> blocks in model output.
+_TOOL_CALL_PATTERN = re.compile(
+    r"<tool_call>\s*(.*?)\s*</tool_call>",
+    re.DOTALL,
+)
+
+
+def _parse_tool_calls_from_text(text: str) -> tuple[str, list[dict]]:
+    """Parse tool_call XML blocks from model text output.
+
+    Supports:
+    - Multiple <tool_call> blocks (one JSON per block)
+    - A single <tool_call> block containing multiple JSON objects (one per line)
+    - JSON objects with or without surrounding whitespace
+
+    Returns (remaining_text, list_of_tool_calls) where each tool_call is:
+    {"id": "call_xxx", "type": "function", "function": {"name": ..., "arguments": ...}}
+    """
+    matches = list(_TOOL_CALL_PATTERN.finditer(text))
+    if not matches:
+        return text, []
+
+    tool_calls = []
+    for match in matches:
+        block_content = match.group(1).strip()
+        # Try parsing as a single JSON object first
+        try:
+            obj = json.loads(block_content)
+            if isinstance(obj, dict) and "name" in obj:
+                name = obj.get("name", "unknown")
+                arguments = obj.get("arguments", {})
+                if isinstance(arguments, dict):
+                    arguments = json.dumps(arguments, ensure_ascii=False)
+                elif not isinstance(arguments, str):
+                    arguments = json.dumps(arguments, ensure_ascii=False)
+                tool_calls.append({
+                    "id": f"call_{uuid.uuid4().hex[:24]}",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": arguments,
+                    },
+                })
+                continue
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        # If single-object parse failed, try line-by-line (multiple JSON objects in one block)
+        for line in block_content.split("\n"):
+            line = line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict) and "name" in obj:
+                    name = obj.get("name", "unknown")
+                    arguments = obj.get("arguments", {})
+                    if isinstance(arguments, dict):
+                        arguments = json.dumps(arguments, ensure_ascii=False)
+                    elif not isinstance(arguments, str):
+                        arguments = json.dumps(arguments, ensure_ascii=False)
+                    tool_calls.append({
+                        "id": f"call_{uuid.uuid4().hex[:24]}",
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments,
+                        },
+                    })
+            except (json.JSONDecodeError, TypeError, KeyError):
+                continue
+
+    if not tool_calls:
+        return text, []
+
+    # Remove the tool_call blocks from the text.
+    # Only keep text that appears BEFORE the first tool_call block.
+    # Text after tool_call blocks is discarded (model shouldn't output it).
+    first_match_start = matches[0].start()
+    remaining = text[:first_match_start].strip()
+    return remaining, tool_calls
 
 
 def _short(s: str, limit: int) -> str:
@@ -359,6 +518,12 @@ async def stream_chat(req: ChatReq) -> AsyncGenerator[str, None]:
     id_ = cid()
     provider, model = parse_model(req.model)
     system, prompt = render_prompt(req.messages)
+
+    # If the request includes tools, inject them into the system prompt so the
+    # model knows what tools are available and how to call them.
+    has_tools = bool(req.tools)
+    if has_tools and req.tools:
+        system = _inject_tools_into_system(system, req.tools)
 
     async with httpx.AsyncClient(auth=AUTH, timeout=None) as client:
         # Open the SSE stream eagerly (and wait for the connection to be live)
@@ -633,7 +798,7 @@ async def _direct_stream(req: ChatReq, api_base: str, api_key: str) -> AsyncGene
         yield "data: [DONE]\n\n"
 
 
-def _anthropic_text(content: str | list[dict] | None) -> str:
+def _anthropic_text(content: Union[str, list, None]) -> str:
     """Render an Anthropic message/system content field as a flat string.
 
     Anthropic uses typed content blocks (text/image/tool_use/tool_result/document).
@@ -841,9 +1006,183 @@ SSE_HEADERS = {
 }
 
 
+async def _collect_chat_completion(req: ChatReq) -> dict:
+    """Non-streaming path: buffer the stream into a single chat completion JSON.
+
+    Used by clients for auxiliary tasks like title generation where they send
+    stream=false and expect a complete JSON response.
+    """
+    text_parts: list[str] = []
+    tool_calls: list[dict] = []
+    finish_reason = "stop"
+
+    if req.tools:
+        # Buffer and parse tool calls
+        async for line in stream_chat(req):
+            if not line.startswith("data:"):
+                continue
+            raw = line[5:].strip()
+            if not raw or raw == "[DONE]":
+                continue
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            for ch in obj.get("choices") or []:
+                d = ch.get("delta") or {}
+                text = d.get("content")
+                if text:
+                    text_parts.append(text)
+
+        full_text = "".join(text_parts)
+        remaining, tool_calls = _parse_tool_calls_from_text(full_text)
+        if tool_calls:
+            finish_reason = "tool_calls"
+            text_parts = [remaining] if remaining else []
+        else:
+            text_parts = [full_text] if full_text else []
+    else:
+        async for line in stream_chat(req):
+            if not line.startswith("data:"):
+                continue
+            raw = line[5:].strip()
+            if not raw or raw == "[DONE]":
+                continue
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            for ch in obj.get("choices") or []:
+                d = ch.get("delta") or {}
+                text = d.get("content")
+                if text:
+                    text_parts.append(text)
+                fr = ch.get("finish_reason")
+                if fr:
+                    finish_reason = fr
+
+    content = "".join(text_parts) if text_parts else None
+    message: dict = {"role": "assistant"}
+    if content:
+        message["content"] = content
+    else:
+        message["content"] = None
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+
+    return {
+        "id": cid(),
+        "object": "chat.completion",
+        "created": now(),
+        "model": req.model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason,
+        }],
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        },
+    }
+
+
+async def _stream_chat_with_tool_parsing(req: ChatReq) -> AsyncGenerator[str, None]:
+    """Buffer stream_chat output, then emit either text or tool_calls.
+
+    When the model's response contains <tool_call>...</tool_call> blocks, we
+    parse them and emit OpenAI-format tool_calls chunks. Any text before the
+    tool_call blocks is emitted as regular content. This allows hosts like
+    Hermes to receive structured tool calls even when going through the
+    OpenCode session path.
+    """
+    id_ = cid()
+
+    # Collect all content from stream_chat
+    full_text_parts: list[str] = []
+    async for line in stream_chat(req):
+        if not line.startswith("data:"):
+            continue
+        raw = line[5:].strip()
+        if not raw or raw == "[DONE]":
+            continue
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        for ch in obj.get("choices") or []:
+            d = ch.get("delta") or {}
+            text = d.get("content")
+            if text:
+                full_text_parts.append(text)
+
+    full_text = "".join(full_text_parts)
+
+    # Try to parse tool calls from the buffered text
+    remaining_text, tool_calls = _parse_tool_calls_from_text(full_text)
+
+    # Emit the role chunk
+    yield chunk(id_, req.model, role="assistant")
+
+    if tool_calls:
+        # Emit any text content before the tool calls
+        if remaining_text:
+            yield chunk(id_, req.model, delta=remaining_text)
+
+        # Emit tool_calls in OpenAI streaming format
+        for idx, tc in enumerate(tool_calls):
+            # First chunk for each tool_call: index + id + function name
+            tc_delta: dict = {
+                "index": idx,
+                "id": tc["id"],
+                "type": "function",
+                "function": {"name": tc["function"]["name"], "arguments": ""},
+            }
+            payload = {
+                "id": id_,
+                "object": "chat.completion.chunk",
+                "created": now(),
+                "model": req.model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"tool_calls": [tc_delta]},
+                    "finish_reason": None,
+                }],
+            }
+            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+            # Second chunk: the arguments
+            tc_args_delta: dict = {
+                "index": idx,
+                "function": {"arguments": tc["function"]["arguments"]},
+            }
+            payload = {
+                "id": id_,
+                "object": "chat.completion.chunk",
+                "created": now(),
+                "model": req.model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"tool_calls": [tc_args_delta]},
+                    "finish_reason": None,
+                }],
+            }
+            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+        # Finish with tool_calls reason
+        yield chunk(id_, req.model, finish="tool_calls")
+    else:
+        # No tool calls found — emit as regular text
+        if full_text:
+            yield chunk(id_, req.model, delta=full_text)
+        yield chunk(id_, req.model, finish="stop")
+
+    yield "data: [DONE]\n\n"
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatReq):
-    # We always stream — the `stream` field on the request is ignored.
     await _refresh_providers()
     provider, model_name = parse_model(req.model)
     api_info = _model_api_info(provider, model_name)
@@ -862,7 +1201,20 @@ async def chat_completions(req: ChatReq):
                 headers=SSE_HEADERS,
             )
 
-    # Fallback: route through OpenCode agent (tools rendered as inline text)
+    # Non-streaming path: buffer the response into a single JSON object.
+    # Used by clients for title generation, embeddings, etc.
+    if not req.stream:
+        return await _collect_chat_completion(req)
+
+    # Fallback: route through OpenCode agent.
+    # When tools are present, we buffer the response and parse tool calls.
+    if req.tools:
+        return StreamingResponse(
+            _stream_chat_with_tool_parsing(req),
+            media_type="text/event-stream",
+            headers=SSE_HEADERS,
+        )
+
     return StreamingResponse(
         stream_chat(req),
         media_type="text/event-stream",

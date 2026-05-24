@@ -36,9 +36,9 @@ pip install -r requirements.txt
 | `OPENCODE_SERVER_USERNAME` | `opencode` | HTTP Basic 用户名（仅在设置了密码时启用）|
 | `OPENCODE_SERVER_PASSWORD` | — | 设置后启用 HTTP Basic auth |
 | `PROXY_PORT` | `8000` | 代理监听端口 |
-| `PROXY_AGENT_MODE` | `on` | `on` 启用 opencode agent + 工具；`off` 仅作模型网关 |
-| `PROXY_SHOW_TOOLS` | `1` | agent 模式下是否把工具调用渲染进文本 |
-| `PROXY_SHOW_REASONING` | `1` | agent 模式下是否把推理过程渲染进文本 |
+| `PROXY_AGENT_MODE` | `off` | `off` 仅作模型网关（host 自带工具链时用这个）；`on` 启用 opencode agent + 工具 |
+| `PROXY_SHOW_TOOLS` | `0` | agent 模式下是否把工具调用渲染进文本（`1` 开启） |
+| `PROXY_SHOW_REASONING` | `0` | agent 模式下是否把推理过程渲染进文本（`1` 开启） |
 | `PROXY_TOOL_RESULT_MAX` | `400` | 工具结果文本截断长度 |
 
 ## 调用示例
