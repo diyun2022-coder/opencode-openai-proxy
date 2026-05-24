@@ -49,7 +49,7 @@ OpenAI 客户端：
 curl http://localhost:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "anthropic/claude-sonnet-4-6",
+    "model": "opencode/big-pickle",
     "messages": [{"role": "user", "content": "hello"}],
     "stream": true
   }'
@@ -61,7 +61,7 @@ Anthropic 客户端：
 curl http://localhost:8000/v1/messages \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "anthropic/claude-sonnet-4-6",
+    "model": "opencode/big-pickle",
     "max_tokens": 1024,
     "messages": [{"role": "user", "content": "hello"}]
   }'
