@@ -6,6 +6,11 @@ set -e
 export NODE_EXTRA_CA_CERTS="${NODE_EXTRA_CA_CERTS:-/etc/ssl/certs/ca-certificates.crt}"
 export NODE_TLS_REJECT_UNAUTHORIZED="${NODE_TLS_REJECT_UNAUTHORIZED:-0}"
 
+# Suppress MaxListenersExceededWarning from opencode's Effect-TS runtime.
+# Each proxy SSE connection registers a listener on opencode's internal event bus;
+# raising the limit silences the warning without affecting correctness.
+export NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=512} --max-listeners=100"
+
 # Start opencode server in the background if not already running
 if ! curl -sf "${OPENCODE_BASE_URL:-http://localhost:4096}/global/health" >/dev/null 2>&1; then
   echo "[start.sh] starting opencode serve..."

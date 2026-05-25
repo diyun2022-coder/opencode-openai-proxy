@@ -1089,18 +1089,22 @@ async def _collect_chat_completion(req: ChatReq) -> dict:
 
 
 async def _stream_chat_with_tool_parsing(req: ChatReq) -> AsyncGenerator[str, None]:
-    """Buffer stream_chat output, then emit either text or tool_calls.
+    """Stream text in real-time, switching to buffer mode only when <tool_call> is detected.
 
-    When the model's response contains <tool_call>...</tool_call> blocks, we
-    parse them and emit OpenAI-format tool_calls chunks. Any text before the
-    tool_call blocks is emitted as regular content. This allows hosts like
-    Hermes to receive structured tool calls even when going through the
-    OpenCode session path.
+    Text before any tool_call block is streamed token-by-token. Once the
+    <tool_call> marker appears, the remainder is buffered and parsed into
+    OpenAI-format tool_calls chunks.
     """
     id_ = cid()
+    MARKER = "<tool_call>"
+    MARKER_LEN = len(MARKER)
 
-    # Collect all content from stream_chat
-    full_text_parts: list[str] = []
+    yield chunk(id_, req.model, role="assistant")
+
+    buffer = ""
+    tool_buffer = ""
+    in_tool_mode = False
+
     async for line in stream_chat(req):
         if not line.startswith("data:"):
             continue
@@ -1114,68 +1118,86 @@ async def _stream_chat_with_tool_parsing(req: ChatReq) -> AsyncGenerator[str, No
         for ch in obj.get("choices") or []:
             d = ch.get("delta") or {}
             text = d.get("content")
-            if text:
-                full_text_parts.append(text)
+            if not text:
+                continue
 
-    full_text = "".join(full_text_parts)
+            if in_tool_mode:
+                tool_buffer += text
+                continue
 
-    # Try to parse tool calls from the buffered text
-    remaining_text, tool_calls = _parse_tool_calls_from_text(full_text)
+            buffer += text
 
-    # Emit the role chunk
-    yield chunk(id_, req.model, role="assistant")
+            marker_pos = buffer.find(MARKER)
+            if marker_pos != -1:
+                before = buffer[:marker_pos]
+                if before:
+                    yield chunk(id_, req.model, delta=before)
+                tool_buffer = buffer[marker_pos:]
+                in_tool_mode = True
+                buffer = ""
+                continue
 
-    if tool_calls:
-        # Emit any text content before the tool calls
-        if remaining_text:
-            yield chunk(id_, req.model, delta=remaining_text)
+            # Hold back any suffix that could be the start of MARKER
+            hold_back = 0
+            for i in range(min(MARKER_LEN - 1, len(buffer)), 0, -1):
+                if buffer.endswith(MARKER[:i]):
+                    hold_back = i
+                    break
 
-        # Emit tool_calls in OpenAI streaming format
-        for idx, tc in enumerate(tool_calls):
-            # First chunk for each tool_call: index + id + function name
-            tc_delta: dict = {
-                "index": idx,
-                "id": tc["id"],
-                "type": "function",
-                "function": {"name": tc["function"]["name"], "arguments": ""},
-            }
-            payload = {
-                "id": id_,
-                "object": "chat.completion.chunk",
-                "created": now(),
-                "model": req.model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {"tool_calls": [tc_delta]},
-                    "finish_reason": None,
-                }],
-            }
-            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            safe_end = len(buffer) - hold_back
+            if safe_end > 0:
+                yield chunk(id_, req.model, delta=buffer[:safe_end])
+                buffer = buffer[safe_end:]
 
-            # Second chunk: the arguments
-            tc_args_delta: dict = {
-                "index": idx,
-                "function": {"arguments": tc["function"]["arguments"]},
-            }
-            payload = {
-                "id": id_,
-                "object": "chat.completion.chunk",
-                "created": now(),
-                "model": req.model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {"tool_calls": [tc_args_delta]},
-                    "finish_reason": None,
-                }],
-            }
-            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    # Stream ended — flush
+    if in_tool_mode:
+        _, tool_calls = _parse_tool_calls_from_text(tool_buffer)
+        if tool_calls:
+            for idx, tc in enumerate(tool_calls):
+                tc_delta: dict = {
+                    "index": idx,
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {"name": tc["function"]["name"], "arguments": ""},
+                }
+                payload = {
+                    "id": id_,
+                    "object": "chat.completion.chunk",
+                    "created": now(),
+                    "model": req.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"tool_calls": [tc_delta]},
+                        "finish_reason": None,
+                    }],
+                }
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
-        # Finish with tool_calls reason
-        yield chunk(id_, req.model, finish="tool_calls")
+                tc_args_delta: dict = {
+                    "index": idx,
+                    "function": {"arguments": tc["function"]["arguments"]},
+                }
+                payload = {
+                    "id": id_,
+                    "object": "chat.completion.chunk",
+                    "created": now(),
+                    "model": req.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"tool_calls": [tc_args_delta]},
+                        "finish_reason": None,
+                    }],
+                }
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+            yield chunk(id_, req.model, finish="tool_calls")
+        else:
+            if tool_buffer:
+                yield chunk(id_, req.model, delta=tool_buffer)
+            yield chunk(id_, req.model, finish="stop")
     else:
-        # No tool calls found — emit as regular text
-        if full_text:
-            yield chunk(id_, req.model, delta=full_text)
+        if buffer:
+            yield chunk(id_, req.model, delta=buffer)
         yield chunk(id_, req.model, finish="stop")
 
     yield "data: [DONE]\n\n"
