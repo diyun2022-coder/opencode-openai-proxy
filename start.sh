@@ -3,7 +3,16 @@ set -e
 
 # opencode runs under Bun, whose bundled CA bundle rejects certs newer than its
 # release. Point Node at the system CA store so upstream TLS handshakes succeed.
-export NODE_EXTRA_CA_CERTS="${NODE_EXTRA_CA_CERTS:-/etc/ssl/certs/ca-certificates.crt}"
+# CA bundle path differs by OS: macOS uses /etc/ssl/cert.pem, Debian/Ubuntu uses
+# ca-certificates.crt, RHEL uses ca-bundle.crt. Pick the first one that exists.
+if [ -z "$NODE_EXTRA_CA_CERTS" ]; then
+  for cand in /etc/ssl/cert.pem /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt; do
+    if [ -r "$cand" ]; then
+      export NODE_EXTRA_CA_CERTS="$cand"
+      break
+    fi
+  done
+fi
 export NODE_TLS_REJECT_UNAUTHORIZED="${NODE_TLS_REJECT_UNAUTHORIZED:-0}"
 
 # Suppress MaxListenersExceededWarning from opencode's Effect-TS runtime.
