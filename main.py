@@ -215,10 +215,11 @@ You have access to the following tools. When you want to call a tool, you MUST o
 
 CRITICAL RULES:
 1. Each <tool_call> block must contain exactly ONE JSON object.
-2. If you need to call multiple tools, use multiple separate <tool_call> blocks.
-3. After outputting tool call blocks, STOP IMMEDIATELY. Do NOT output any other text after the </tool_call> tags.
-4. Do NOT predict or fabricate tool results. Wait for the actual results to be provided.
-5. If you want to include a brief explanation before calling tools, put it BEFORE the <tool_call> blocks.
+2. ALWAYS close every <tool_call> block with a matching </tool_call> tag on its own line. A missing </tool_call> will cause the tool call to fail to dispatch.
+3. If you need to call multiple tools, use multiple separate <tool_call>...</tool_call> blocks — each one fully opened and closed.
+4. After outputting tool call blocks, STOP IMMEDIATELY. Do NOT output any other text after the </tool_call> tags.
+5. Do NOT predict or fabricate tool results. Wait for the actual results to be provided.
+6. If you want to include a brief explanation before calling tools, put it BEFORE the <tool_call> blocks.
 
 Here are the available tools:
 
@@ -263,86 +264,80 @@ def _inject_tools_into_system(system: Optional[str], tools: list[dict]) -> str:
     return tool_text.strip()
 
 
-# Regex to find <tool_call>...</tool_call> blocks in model output.
-_TOOL_CALL_PATTERN = re.compile(
-    r"<tool_call>\s*(.*?)\s*</tool_call>",
-    re.DOTALL,
-)
+# Marker that opens a tool_call block. We don't require a paired </tool_call>
+# close tag — many models drop it under length pressure or get truncated mid-
+# stream, and the original strict-regex parser silently fell back to emitting
+# the buffer as plain text in that case.
+_TOOL_CALL_OPEN = re.compile(r"<\s*tool_call\s*>", re.IGNORECASE)
+
+
+def _make_tool_call(obj: dict) -> Optional[dict]:
+    if not isinstance(obj, dict) or "name" not in obj:
+        return None
+    name = obj.get("name") or "unknown"
+    arguments = obj.get("arguments", {})
+    if not isinstance(arguments, str):
+        arguments = json.dumps(arguments, ensure_ascii=False)
+    return {
+        "id": f"call_{uuid.uuid4().hex[:24]}",
+        "type": "function",
+        "function": {"name": name, "arguments": arguments},
+    }
 
 
 def _parse_tool_calls_from_text(text: str) -> tuple[str, list[dict]]:
-    """Parse tool_call XML blocks from model text output.
+    """Parse tool_call blocks from model text output.
 
-    Supports:
-    - Multiple <tool_call> blocks (one JSON per block)
-    - A single <tool_call> block containing multiple JSON objects (one per line)
-    - JSON objects with or without surrounding whitespace
+    Uses json.JSONDecoder.raw_decode to extract a complete JSON object starting
+    after each <tool_call> marker. This is tolerant of:
+    - Missing </tool_call> closing tags (the common failure mode)
+    - Multiple JSON objects after one marker
+    - Stray non-JSON text between blocks
+    - Truncation mid-JSON (just drops the partial call)
 
-    Returns (remaining_text, list_of_tool_calls) where each tool_call is:
-    {"id": "call_xxx", "type": "function", "function": {"name": ..., "arguments": ...}}
+    Returns (remaining_text, list_of_tool_calls).
     """
-    matches = list(_TOOL_CALL_PATTERN.finditer(text))
-    if not matches:
+    if not _TOOL_CALL_OPEN.search(text):
         return text, []
 
-    tool_calls = []
-    for match in matches:
-        block_content = match.group(1).strip()
-        # Try parsing as a single JSON object first
-        try:
-            obj = json.loads(block_content)
-            if isinstance(obj, dict) and "name" in obj:
-                name = obj.get("name", "unknown")
-                arguments = obj.get("arguments", {})
-                if isinstance(arguments, dict):
-                    arguments = json.dumps(arguments, ensure_ascii=False)
-                elif not isinstance(arguments, str):
-                    arguments = json.dumps(arguments, ensure_ascii=False)
-                tool_calls.append({
-                    "id": f"call_{uuid.uuid4().hex[:24]}",
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "arguments": arguments,
-                    },
-                })
-                continue
-        except (json.JSONDecodeError, TypeError):
-            pass
+    decoder = json.JSONDecoder()
+    tool_calls: list[dict] = []
+    first_real_marker: Optional[int] = None
+    pos = 0
 
-        # If single-object parse failed, try line-by-line (multiple JSON objects in one block)
-        for line in block_content.split("\n"):
-            line = line.strip()
-            if not line or not line.startswith("{"):
-                continue
+    while pos < len(text):
+        m = _TOOL_CALL_OPEN.search(text, pos)
+        if not m:
+            break
+        i = m.end()
+        parsed_any = False
+        while i < len(text):
+            while i < len(text) and text[i] in " \t\r\n":
+                i += 1
+            if i >= len(text) or text[i] != "{":
+                break
             try:
-                obj = json.loads(line)
-                if isinstance(obj, dict) and "name" in obj:
-                    name = obj.get("name", "unknown")
-                    arguments = obj.get("arguments", {})
-                    if isinstance(arguments, dict):
-                        arguments = json.dumps(arguments, ensure_ascii=False)
-                    elif not isinstance(arguments, str):
-                        arguments = json.dumps(arguments, ensure_ascii=False)
-                    tool_calls.append({
-                        "id": f"call_{uuid.uuid4().hex[:24]}",
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": arguments,
-                        },
-                    })
-            except (json.JSONDecodeError, TypeError, KeyError):
-                continue
+                obj, end_idx = decoder.raw_decode(text, i)
+            except json.JSONDecodeError:
+                break
+            tc = _make_tool_call(obj)
+            if tc is None:
+                # JSON parsed but wasn't a tool-call shape — stop scanning this
+                # block so we don't accidentally grab unrelated JSON.
+                break
+            tool_calls.append(tc)
+            parsed_any = True
+            i = end_idx
+        if parsed_any and first_real_marker is None:
+            first_real_marker = m.start()
+        # Always advance past this marker so we don't loop forever on a stray
+        # <tool_call> with no JSON after it.
+        pos = max(i, m.end())
 
     if not tool_calls:
         return text, []
 
-    # Remove the tool_call blocks from the text.
-    # Only keep text that appears BEFORE the first tool_call block.
-    # Text after tool_call blocks is discarded (model shouldn't output it).
-    first_match_start = matches[0].start()
-    remaining = text[:first_match_start].strip()
+    remaining = text[:first_real_marker].strip() if first_real_marker is not None else ""
     return remaining, tool_calls
 
 
