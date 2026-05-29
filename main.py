@@ -285,15 +285,98 @@ def _make_tool_call(obj: dict) -> Optional[dict]:
     }
 
 
+def _parse_xml_tool_call(text: str, start: int) -> tuple[Optional[dict], int]:
+    """Parse XML-format tool call: <function=name><parameter=key>value</parameter></function>
+
+    Returns (tool_call_dict, end_position) or (None, start) if parsing fails.
+    """
+    i = start
+    # Skip whitespace
+    while i < len(text) and text[i] in " \t\r\n":
+        i += 1
+
+    # Look for <function=name> or <function name="...">
+    if i >= len(text) or text[i] != '<':
+        return None, start
+
+    # Find the function tag
+    func_match = re.match(r'<\s*function\s*=\s*([^>\s]+)\s*>', text[i:], re.IGNORECASE)
+    if not func_match:
+        # Try alternate format: <function name="...">
+        func_match = re.match(r'<\s*function\s+name\s*=\s*["\']([^"\']+)["\']\s*>', text[i:], re.IGNORECASE)
+
+    if not func_match:
+        return None, start
+
+    func_name = func_match.group(1)
+    i += func_match.end()
+
+    # Parse parameters
+    arguments = {}
+    while i < len(text):
+        # Skip whitespace
+        while i < len(text) and text[i] in " \t\r\n":
+            i += 1
+
+        if i >= len(text):
+            break
+
+        # Check for closing </function>
+        if text[i:i+10].lower().startswith('</function'):
+            close_match = re.match(r'</\s*function\s*>', text[i:], re.IGNORECASE)
+            if close_match:
+                i += close_match.end()
+                break
+            else:
+                break
+
+        # Parse <parameter=key>value</parameter> or <parameter name="key">value</parameter>
+        param_match = re.match(r'<\s*parameter\s*=\s*([^>\s]+)\s*>', text[i:], re.IGNORECASE)
+        if not param_match:
+            param_match = re.match(r'<\s*parameter\s+name\s*=\s*["\']([^"\']+)["\']\s*>', text[i:], re.IGNORECASE)
+
+        if not param_match:
+            break
+
+        param_name = param_match.group(1)
+        i += param_match.end()
+
+        # Find closing </parameter>
+        close_tag = '</parameter>'
+        close_idx = text.lower().find(close_tag, i)
+        if close_idx == -1:
+            # No closing tag, take rest until next tag or end
+            next_tag = text.find('<', i)
+            if next_tag == -1:
+                param_value = text[i:].strip()
+                i = len(text)
+            else:
+                param_value = text[i:next_tag].strip()
+                i = next_tag
+        else:
+            param_value = text[i:close_idx].strip()
+            i = close_idx + len(close_tag)
+
+        arguments[param_name] = param_value
+
+    if not func_name:
+        return None, start
+
+    return _make_tool_call({"name": func_name, "arguments": arguments}), i
+
+
 def _parse_tool_calls_from_text(text: str) -> tuple[str, list[dict]]:
     """Parse tool_call blocks from model text output.
 
-    Uses json.JSONDecoder.raw_decode to extract a complete JSON object starting
-    after each <tool_call> marker. This is tolerant of:
+    Supports two formats:
+    1. JSON: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
+    2. XML: <tool_call><function=name><parameter=key>value</parameter></function></tool_call>
+
+    Tolerant of:
     - Missing </tool_call> closing tags (the common failure mode)
-    - Multiple JSON objects after one marker
+    - Multiple tool calls after one marker
     - Stray non-JSON text between blocks
-    - Truncation mid-JSON (just drops the partial call)
+    - Truncation mid-JSON/XML (just drops the partial call)
 
     Returns (remaining_text, list_of_tool_calls).
     """
@@ -311,23 +394,40 @@ def _parse_tool_calls_from_text(text: str) -> tuple[str, list[dict]]:
             break
         i = m.end()
         parsed_any = False
-        while i < len(text):
-            while i < len(text) and text[i] in " \t\r\n":
-                i += 1
-            if i >= len(text) or text[i] != "{":
-                break
-            try:
-                obj, end_idx = decoder.raw_decode(text, i)
-            except json.JSONDecodeError:
-                break
-            tc = _make_tool_call(obj)
-            if tc is None:
-                # JSON parsed but wasn't a tool-call shape — stop scanning this
-                # block so we don't accidentally grab unrelated JSON.
-                break
-            tool_calls.append(tc)
-            parsed_any = True
-            i = end_idx
+
+        # Skip whitespace to detect format
+        while i < len(text) and text[i] in " \t\r\n":
+            i += 1
+
+        if i >= len(text):
+            break
+
+        # Detect format: JSON starts with {, XML starts with <
+        if text[i] == '{':
+            # JSON format (original logic)
+            while i < len(text):
+                while i < len(text) and text[i] in " \t\r\n":
+                    i += 1
+                if i >= len(text) or text[i] != "{":
+                    break
+                try:
+                    obj, end_idx = decoder.raw_decode(text, i)
+                except json.JSONDecodeError:
+                    break
+                tc = _make_tool_call(obj)
+                if tc is None:
+                    break
+                tool_calls.append(tc)
+                parsed_any = True
+                i = end_idx
+        elif text[i] == '<':
+            # XML format (new logic)
+            tc, end_idx = _parse_xml_tool_call(text, i)
+            if tc:
+                tool_calls.append(tc)
+                parsed_any = True
+                i = end_idx
+
         if parsed_any and first_real_marker is None:
             first_real_marker = m.start()
         # Always advance past this marker so we don't loop forever on a stray
